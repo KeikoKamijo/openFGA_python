@@ -1,12 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException
-from openfga_sdk.client.models import ClientTuple, ClientWriteRequest
-from openfga_sdk.client import ClientCheckRequest
+from typing import List
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app import schemas
 from app.models import Resource
 from app.schemas import MessageResponse, UserInfo
-from app.auth_decorators import get_current_user, require_permission, check_resource_permission
-from config import get_db, fga_client
+from app.auth_decorators import get_current_user, require_permission
+from app.services.permission_service import PermissionService
+from app.exceptions import ResourceNotFoundException, FGAOperationException
+from config import get_db
 
 router = APIRouter(
     prefix="/api/v1",
@@ -16,18 +17,36 @@ router = APIRouter(
 async def health_check():
     return {"status": "healthy"}
 
-@router.get("/resources", response_model=list[schemas.ResourceResponse])
+@router.get("/resources", response_model=List[schemas.ResourceResponse])
 async def list_resources(
         user_email: str = Depends(get_current_user),
         db: Session = Depends(get_db)
 ):
     resources = db.query(Resource).all()
-
-    accessible_resources = []
-    for resource in resources:
-        if await check_resource_permission(user_email, str(resource.uuid), "viewer"):
-            accessible_resources.append(resource)
-
+    
+    if not resources:
+        return []
+    
+    # バッチチェックで効率化
+    resource_uuids = [str(r.uuid) for r in resources]
+    try:
+        permissions = await PermissionService.batch_check_permissions(
+            user_email, resource_uuids, "viewer"
+        )
+    except Exception:
+        # フォールバック: 個別チェック
+        permissions = []
+        for uuid in resource_uuids:
+            try:
+                allowed = await PermissionService.check_permission(user_email, uuid, "viewer")
+                permissions.append(allowed)
+            except Exception:
+                permissions.append(False)
+    
+    accessible_resources = [
+        resource for resource, allowed in zip(resources, permissions) if allowed
+    ]
+    
     return accessible_resources
 
 
@@ -42,23 +61,15 @@ async def create_resource(
     db.commit()
     db.refresh(new_resource)
 
-    write_request = ClientWriteRequest(
-    writes=[
-        ClientTuple(
-            user=f"user:{user_email}",
-            relation="owner",
-            object=f"resource:{new_resource.uuid}",
-        )
-    ]
-)
     try:
-        await fga_client.write(write_request)
-    except Exception as e:
-        print(f"Error writing FGA tuple for resource {new_resource.uuid}: {e}")
-
+        await PermissionService.grant_permission(
+            user_email, str(new_resource.uuid), "owner"
+        )
+    except FGAOperationException as e:
+        # ロールバック
         db.delete(new_resource)
         db.commit()
-        raise HTTPException(status_code=500, detail=f"Failed to set permissions: {str(e)}")
+        raise e
 
     return new_resource
 
@@ -72,12 +83,13 @@ async def get_resource(
 ):
     resource = db.query(Resource).filter(Resource.uuid == resource_uuid).first()
     if not resource:
-        raise HTTPException(status_code=404, detail="Resource not found")
+        raise ResourceNotFoundException(resource_uuid)
     
     return resource
 
 
 @router.post("/resources/{resource_uuid}/share", response_model=schemas.ShareResponse)
+@require_permission("owner")
 async def share_resource(
     resource_uuid: str,
     share_request: schemas.ShareRequest,
@@ -86,29 +98,13 @@ async def share_resource(
 ):
     resource = db.query(Resource).filter(Resource.uuid == resource_uuid).first()
     if not resource:
-        raise HTTPException(status_code=404, detail="Resource not found")
-
-    check_request = ClientCheckRequest(
-        user=f"user:{user_email}",
-        relation="owner",  # 'owner' でチェック
-        object=f"resource:{resource.uuid}",
+        raise ResourceNotFoundException(resource_uuid)
+    
+    await PermissionService.grant_permission(
+        share_request.user_email, 
+        str(resource.uuid), 
+        share_request.relation
     )
-    response = await fga_client.check(check_request)
-    if not response.allowed:
-        raise HTTPException(status_code=403, detail="Access denied")
-    write_request = ClientWriteRequest(
-        writes=[
-            ClientTuple(
-                user=f"user:{share_request.user_email}",
-                relation=share_request.relation,  # 'viewer' など
-                object=f"resource:{resource.uuid}",
-            )
-        ]
-    )
-    try:
-        await fga_client.write(write_request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to share resource: {str(e)}")
 
     return schemas.ShareResponse(
         message="Resource shared successfully",
@@ -127,7 +123,7 @@ async def delete_resource(
 ):
     resource = db.query(Resource).filter(Resource.uuid == resource_uuid).first()
     if not resource:
-        raise HTTPException(status_code=404, detail="Resource not found")
+        raise ResourceNotFoundException(resource_uuid)
 
     db.delete(resource)
     db.commit()

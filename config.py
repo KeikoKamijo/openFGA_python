@@ -1,8 +1,9 @@
 import os
+from typing import Generator
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 from openfga_sdk.client import OpenFgaClient, ClientConfiguration
 
 load_dotenv()
@@ -18,13 +19,8 @@ class Config:
     AUTH0_CLIENT_SECRET = os.getenv('AUTH0_CLIENT_SECRET')
     AUTH0_DOMAIN = os.getenv('AUTH0_DOMAIN')
     AUTH0_API_AUDIENCE = os.getenv('AUTH0_API_AUDIENCE')
-
-configuration = ClientConfiguration(
-    api_url=Config.FGA_API_URL,
-    store_id=Config.FGA_STORE_ID,
-    authorization_model_id=Config.FGA_MODEL_ID,  # .envの最新IDに更新しておく
-)
-fga_client = OpenFgaClient(configuration)
+    DEFAULT_USER_EMAIL = os.getenv('DEFAULT_USER_EMAIL', 'alice@example.com')
+    DEFAULT_USER_ROLE = os.getenv('DEFAULT_USER_ROLE', 'guest')
 
 # SQLAlchemy setup
 engine = create_engine(
@@ -43,7 +39,7 @@ configuration = ClientConfiguration(
 fga_client = OpenFgaClient(configuration)
 
 # Database dependency
-def get_db():
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db

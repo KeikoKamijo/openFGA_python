@@ -1,7 +1,9 @@
 from functools import wraps
+from typing import Optional
 from fastapi import HTTPException, Header
 from openfga_sdk.client import ClientCheckRequest
-from config import fga_client
+from config import fga_client, Config
+from app.exceptions import PermissionDeniedException
 
 # RBAC定義
 ROLE_PERMISSIONS = {
@@ -11,14 +13,16 @@ ROLE_PERMISSIONS = {
     "guest": []
 }
 
+# デフォルトユーザーロールマッピング
+DEFAULT_USER_ROLES = {
+    "alice@example.com": ["admin"],
+    "bob@example.com": ["viewer"], 
+    "charlie@example.com": ["guest"]
+}
+
 def get_user_roles(user_email: str) -> list[str]:
     """ユーザーのロールを取得（実際はJWTやDBから）"""
-    role_mapping = {
-        "alice@example.com": ["admin"],
-        "bob@example.com": ["viewer"], 
-        "charlie@example.com": ["guest"]
-    }
-    return role_mapping.get(user_email, ["guest"])
+    return DEFAULT_USER_ROLES.get(user_email, ["guest"])
 
 def has_role_permission(user_email: str, action: str) -> bool:
     """RBAC: ロールベースの権限チェック"""
@@ -38,10 +42,10 @@ async def has_resource_permission(user_email: str, resource_uuid: str, relation:
     try:
         response = await fga_client.check(check_request)
         return response.allowed
-    except:
+    except Exception:
         return False
 
-def require_permission(action: str, resource_relation: str = None):
+def require_permission(action: str, resource_relation: Optional[str] = None):
     """ハイブリッド権限チェックのデコレータ"""
     def decorator(func):
         @wraps(func)
@@ -59,7 +63,7 @@ def require_permission(action: str, resource_relation: str = None):
                     return await func(*args, **kwargs)
             
             # 3. どちらも通らない場合は拒否
-            raise HTTPException(status_code=403, detail="Access denied")
+            raise PermissionDeniedException()
         
         return wrapper
     return decorator
