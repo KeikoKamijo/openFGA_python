@@ -1,20 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException
 from openfga_sdk.client.models import ClientTuple, ClientWriteRequest
 from openfga_sdk.client import ClientCheckRequest
 from sqlalchemy.orm import Session
 from app import schemas
 from app.models import Resource
 from app.schemas import MessageResponse, UserInfo
+from app.auth_decorators import get_current_user, require_permission, check_resource_permission
 from config import get_db, fga_client
 
 router = APIRouter(
     prefix="/api/v1",
 )
-
-
-def get_current_user(x_user_email: str | None = Header(default=None)) -> str:
-    return x_user_email or "alice@example.com"
-
 
 @router.get("/health", response_model=schemas.HealthResponse)
 async def health_check():
@@ -29,17 +25,8 @@ async def list_resources(
 
     accessible_resources = []
     for resource in resources:
-        check_request = ClientCheckRequest(
-    user=f"user:{user_email}",
-    relation="viewer",
-    object=f"resource:{resource.uuid}",
-)
-        try:
-            response = await fga_client.check(check_request)
-            if response.allowed:
-                accessible_resources.append(resource)
-        except Exception as e:
-            print(f"Error checking access for resource {resource.uuid}: {e}")
+        if await check_resource_permission(user_email, str(resource.uuid), "viewer"):
+            accessible_resources.append(resource)
 
     return accessible_resources
 
@@ -77,6 +64,7 @@ async def create_resource(
 
 
 @router.get("/resources/{resource_uuid}", response_model=schemas.ResourceResponse)
+@require_permission("viewer")
 async def get_resource(
     resource_uuid: str,
     user_email: str = Depends(get_current_user),
@@ -85,19 +73,7 @@ async def get_resource(
     resource = db.query(Resource).filter(Resource.uuid == resource_uuid).first()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-
-    check_request = ClientCheckRequest(
-    user=f"user:{user_email}",
-    relation="viewer",
-    object=f"resource:{resource.uuid}",
-)
-    try:
-        response = await fga_client.check(check_request)
-        if not response.allowed:
-            raise HTTPException(status_code=403, detail="Access denied")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FGA check failed: {str(e)}")
-
+    
     return resource
 
 
@@ -143,6 +119,7 @@ async def share_resource(
 
 
 @router.delete("/resources/{resource_uuid}", response_model=schemas.MessageResponse)
+@require_permission("owner")
 async def delete_resource(
     resource_uuid: str,
     user_email: str = Depends(get_current_user),
@@ -151,15 +128,6 @@ async def delete_resource(
     resource = db.query(Resource).filter(Resource.uuid == resource_uuid).first()
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-
-    check_request = ClientCheckRequest(
-    user=f"user:{user_email}",
-    relation="owner",
-    object=f"resource:{resource.uuid}",
-)
-    response = await fga_client.check(check_request)
-    if not response.allowed:
-        raise HTTPException(status_code=403, detail="Access denied")
 
     db.delete(resource)
     db.commit()
